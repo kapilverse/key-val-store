@@ -5,6 +5,7 @@
 #include <shared_mutex>
 #include <string>
 #include <vector>
+#include "manifest.h"
 #include "memtable.h"
 #include "wal.h"
 
@@ -16,6 +17,7 @@ struct DBStats {
     size_t   sstable_count     = 0;
     size_t   wal_replayed      = 0;   // entries replayed on startup
     uint64_t active_wal_id     = 0;   // current WAL segment number
+    uint64_t manifest_gen      = 0;   // MANIFEST generation number
 };
 
 class DB {
@@ -51,12 +53,14 @@ private:
 
     uint64_t next_sst_id_    = 0;
     uint64_t current_wal_id_ = 0;  // ID of the active wal_NNNNNN.log segment
+    uint64_t manifest_gen_   = 0;  // monotonically increasing MANIFEST generation
     size_t   wal_replayed_   = 0;
 
     void recover();
-    void flush_memtable_locked();   // assumes unique lock held
-    void compact_locked();          // assumes unique lock held
-    void maybe_flush();             // called inside write path (lock already held)
+    void flush_memtable_locked();     // assumes unique lock held
+    void compact_locked();            // assumes unique lock held
+    void maybe_flush();               // called inside write path (lock already held)
+    void update_manifest_locked();    // writes current sstables_ to MANIFEST atomically
     std::filesystem::path sst_path(uint64_t id) const;
     std::filesystem::path wal_seg_path(uint64_t id) const;
 };
