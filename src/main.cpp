@@ -73,6 +73,7 @@ int main(int argc, char* argv[]) {
                 << "memtable : " << st.memtable_entries << " entries, "
                                  << st.memtable_bytes   << " bytes\n"
                 << "sstables : " << st.sstable_count    << " file(s)\n"
+                << "manifest : generation " << st.manifest_gen << "\n"
                 << "wal seg  : wal_" << std::setfill('0') << std::setw(6)
                                  << st.active_wal_id    << ".log\n"
                 << "recovery : " << st.wal_replayed     << " WAL entries replayed\n";
