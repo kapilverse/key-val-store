@@ -13,6 +13,8 @@ else()
 endif()
 
 add_library(kvlib STATIC
+    src/bloom.cpp
+    src/manifest.cpp
     src/wal.cpp
     src/memtable.cpp
     src/sstable.cpp
