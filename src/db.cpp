@@ -2,6 +2,7 @@
 #include "sstable.h"
 #include <algorithm>
 #include <cstdio>
+#include <set>
 #include <stdexcept>
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -22,45 +23,79 @@ std::filesystem::path DB::wal_seg_path(uint64_t id) const {
 
 // ── recovery ─────────────────────────────────────────────────────────────────
 // On startup:
-//   1. Delete any sealed (.log.done) WAL segments — their data is already in
-//      an SSTable that was fully written before the seal was committed.
-//   2. Load all SSTable files.
-//   3. Replay every active (.log) WAL segment into the MemTable.
-//      In the normal case there is exactly one; after a crash there may be
-//      more, and replaying all of them is always correct (worst case: some
-//      keys end up in both MemTable and SSTables, which is harmless — MemTable
-//      is checked first and the duplicate gets cleaned up at next flush).
-//   4. Open the most-recent active segment for future appends (or create one).
+//   1. Delete MANIFEST.tmp (leftover from a crashed atomic write — the old
+//      MANIFEST was not replaced, so it remains authoritative).
+//   2. Delete sealed WAL segments (.log.done).
+//   3. Load SSTable list from MANIFEST (deterministic).
+//      Fallback: directory scan if no MANIFEST exists (first-ever start, or
+//      upgrade from a build that predates MANIFEST).
+//   4. Delete orphaned .sst files not listed in MANIFEST — they come from
+//      interrupted compactions where the new SSTable was written but the
+//      MANIFEST rename had not yet committed.
+//   5. Replay active WAL segments into the MemTable.
+//   6. Open (or create) the active WAL segment.
 
 void DB::recover() {
     namespace fs = std::filesystem;
+    std::error_code ec;
 
-    // Step 1 — delete sealed segments (commit already happened before sealing).
+    // Step 1
+    fs::remove(dir_ / "MANIFEST.tmp", ec);
+
+    // Step 2
     for (auto& de : fs::directory_iterator(dir_)) {
         auto& p = de.path();
-        // Sealed files have extension ".done"; their stem ends in ".log".
-        if (p.extension() == ".done" && p.stem().extension() == ".log") {
-            std::error_code ec;
+        if (p.extension() == ".done" && p.stem().extension() == ".log")
             fs::remove(p, ec);
+    }
+
+    // Step 3 — load SSTables
+    if (Manifest::exists(dir_)) {
+        auto data = Manifest::read(dir_);
+        manifest_gen_ = data.generation;
+        for (auto& name : data.live_sstables) {
+            auto p = dir_ / name;
+            // Extract numeric ID from "sst_000003.sst"
+            auto stem = fs::path(name).stem().string();   // "sst_000003"
+            uint64_t id = std::stoull(stem.substr(4));
+            next_sst_id_ = std::max(next_sst_id_, id + 1);
+            sstables_.push_back(std::make_shared<SSTable>(p));
+        }
+        // sstables_ stays in MANIFEST order (newest-first, as written).
+    } else {
+        // First startup — scan directory (no MANIFEST yet).
+        for (auto& de : fs::directory_iterator(dir_)) {
+            auto& p = de.path();
+            if (p.extension() != ".sst") continue;
+            std::string stem = p.stem().string();
+            if (stem.size() < 4 || stem.substr(0, 4) != "sst_") continue;
+            uint64_t id = std::stoull(stem.substr(4));
+            next_sst_id_ = std::max(next_sst_id_, id + 1);
+            sstables_.push_back(std::make_shared<SSTable>(p));
+        }
+        std::sort(sstables_.begin(), sstables_.end(),
+            [](const auto& a, const auto& b) {
+                return a->path().stem().string() > b->path().stem().string();
+            });
+        // Write initial MANIFEST so future restarts are deterministic.
+        update_manifest_locked();
+    }
+
+    // Step 4 — delete orphaned SSTable files not listed in the MANIFEST.
+    // These are new SSTables from interrupted compactions (built, but MANIFEST
+    // rename hadn't committed yet).
+    {
+        std::set<std::string> live;
+        for (auto& sst : sstables_)
+            live.insert(sst->path().filename().string());
+        for (auto& de : fs::directory_iterator(dir_)) {
+            if (de.path().extension() != ".sst") continue;
+            if (live.find(de.path().filename().string()) == live.end())
+                fs::remove(de.path(), ec);
         }
     }
 
-    // Step 2 — load SSTables.
-    for (auto& de : fs::directory_iterator(dir_)) {
-        auto& p = de.path();
-        if (p.extension() != ".sst") continue;
-        std::string stem = p.stem().string();
-        if (stem.size() < 4 || stem.substr(0, 4) != "sst_") continue;
-        uint64_t id = std::stoull(stem.substr(4));
-        next_sst_id_ = std::max(next_sst_id_, id + 1);
-        sstables_.push_back(std::make_shared<SSTable>(p));
-    }
-    std::sort(sstables_.begin(), sstables_.end(),
-        [](const auto& a, const auto& b) {
-            return a->path().stem().string() > b->path().stem().string();
-        });
-
-    // Step 3 — collect and replay active WAL segments (oldest first).
+    // Step 5 — replay active WAL segments (oldest-first).
     std::vector<std::pair<uint64_t, fs::path>> segs;
     for (auto& de : fs::directory_iterator(dir_)) {
         auto& p = de.path();
@@ -71,7 +106,6 @@ void DB::recover() {
         segs.push_back({id, p});
     }
     std::sort(segs.begin(), segs.end());
-
     for (auto& [id, path] : segs) {
         current_wal_id_ = std::max(current_wal_id_, id);
         WAL reader(path);
@@ -82,10 +116,21 @@ void DB::recover() {
         });
     }
 
-    // Step 4 — open the active segment (reuse found one, or create fresh).
-    // current_wal_id_ must be >= next_sst_id_ to avoid naming collisions.
+    // Step 6 — open active WAL segment (ID must be above all SST IDs).
     current_wal_id_ = std::max(current_wal_id_, next_sst_id_);
     wal_ = std::make_unique<WAL>(wal_seg_path(current_wal_id_));
+}
+
+// ── update_manifest_locked ────────────────────────────────────────────────────
+// Writes the current sstables_ list to MANIFEST atomically.
+// Caller must hold a unique lock.
+
+void DB::update_manifest_locked() {
+    ManifestData data;
+    data.generation = ++manifest_gen_;
+    for (auto& sst : sstables_)
+        data.live_sstables.push_back(sst->path().filename().string());
+    Manifest::write(dir_, data);
 }
 
 // ── construction / destruction ────────────────────────────────────────────────
@@ -160,27 +205,34 @@ void DB::flush_memtable_locked() {
     if (memtable_.empty()) return;
     namespace fs = std::filesystem;
 
-    // Step 1
+    // 1. Build SSTable and fsync it — data is now durable on disk.
     uint64_t sst_id = next_sst_id_++;
     auto sst = sst_path(sst_id);
-    SSTable::build(sst, memtable_.data());   // fsyncs internally
+    SSTable::build(sst, memtable_.data());
     sstables_.insert(sstables_.begin(), std::make_shared<SSTable>(sst));
 
-    // Steps 2 & 3 — seal the current WAL segment.
+    // 2. Write MANIFEST — this makes the new SSTable officially live.
+    //    This must happen BEFORE sealing the WAL so that, on a crash between
+    //    here and the WAL seal, recovery finds the SSTable in the MANIFEST and
+    //    replays the (still-active) WAL without data loss.
+    update_manifest_locked();
+
+    // 3. Seal the WAL segment (rename → .done).  The WAL data is now in
+    //    both the SSTable and the MANIFEST; recovery no longer needs it.
     auto old_seg  = wal_seg_path(current_wal_id_);
-    wal_.reset();                           // fflush + fclose
+    wal_.reset();                                       // fflush + fclose
     auto done_seg = fs::path(old_seg.string() + ".done");
     std::error_code ec;
-    fs::rename(old_seg, done_seg, ec);      // commit point
+    fs::rename(old_seg, done_seg, ec);
 
-    // Step 4 — next segment ID sits above both SST IDs and old WAL IDs.
+    // 4. Open the next WAL segment.
     current_wal_id_ = next_sst_id_;
     wal_ = std::make_unique<WAL>(wal_seg_path(current_wal_id_));
 
-    // Step 5
+    // 5. Clear the MemTable — writes now go into the fresh WAL segment.
     memtable_.clear();
 
-    // Step 6 — clean up the sealed segment (best-effort).
+    // 6. Delete the sealed WAL (lazy cleanup — safe to defer).
     fs::remove(done_seg, ec);
 }
 
@@ -223,17 +275,27 @@ void DB::compact_locked() {
             clean[k] = MemEntry{e.value, false};
     }
 
-    auto new_id = next_sst_id_++;
+    auto new_id   = next_sst_id_++;
     auto new_path = sst_path(new_id);
-    SSTable::build(new_path, clean);
+    SSTable::build(new_path, clean);   // fsyncs internally
 
-    // Swap in the new SSTable and delete the old files.
+    // Swap sstables_ to point only at the merged file.
     auto old = std::move(sstables_);
     sstables_.clear();
     sstables_.push_back(std::make_shared<SSTable>(new_path));
 
-    for (auto& sst : old)
-        std::filesystem::remove(sst->path());
+    // MANIFEST update is the commit point for compaction.
+    // After this rename: new SSTable is authoritative.
+    // Old files on disk are now orphans — safe to delete below.
+    // If we crash before this: old SSTables are still in MANIFEST and will
+    // be loaded on recovery; the new file is an orphan (deleted on startup).
+    update_manifest_locked();
+
+    // Delete old SSTable files — they're no longer in the MANIFEST.
+    for (auto& sst : old) {
+        std::error_code ec;
+        std::filesystem::remove(sst->path(), ec);
+    }
 }
 
 void DB::compact() {
@@ -246,5 +308,5 @@ void DB::compact() {
 DBStats DB::stats() const {
     std::shared_lock lock(mu_);
     return {memtable_.size(), memtable_.bytes(),
-            sstables_.size(), wal_replayed_, current_wal_id_};
+            sstables_.size(), wal_replayed_, current_wal_id_, manifest_gen_};
 }
