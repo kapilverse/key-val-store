@@ -11,6 +11,33 @@
 
 class SSTable;
 
+// LSM-tree key-value store.
+//
+// Thread safety: all public methods are safe to call from multiple threads.
+// put/del/flush/compact take an exclusive lock; get/stats take a shared lock
+// (multiple readers run concurrently without blocking each other).
+//
+// Durability contract: put() and del() return only after the WAL record has
+// been fsynced to disk.  A crash after the call returns will not lose the
+// write.  A crash during the call may lose it (the write was never
+// acknowledged to the caller).
+//
+// Crash-safe flush sequence (flush_memtable_locked):
+//   1. Build SSTable + fsync            → data on disk
+//   2. MANIFEST atomic write (rename)   ← commit point: SSTable is now live
+//   3. Seal WAL: rename .log → .log.done  (data already in SSTable)
+//   4. Open next WAL segment
+//   5. Clear MemTable
+//   6. Delete .done file (lazy)
+//
+// Recovery on constructor (recover()):
+//   1. Remove MANIFEST.tmp (partial write from a previous run)
+//   2. Delete .log.done files (sealed WAL segments — data already durable)
+//   3. Load SSTable list from MANIFEST
+//   4. Delete orphan .sst files not listed in MANIFEST
+//   5. Replay active .log WAL files oldest-first into the MemTable
+//   6. Open (or create) the active WAL segment
+
 struct DBStats {
     size_t   memtable_entries  = 0;
     size_t   memtable_bytes    = 0;

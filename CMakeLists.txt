@@ -24,3 +24,12 @@ target_include_directories(kvlib PUBLIC include)
 
 add_executable(kvstore src/main.cpp)
 target_link_libraries(kvstore PRIVATE kvlib)
+
+add_executable(bench src/bench.cpp)
+target_link_libraries(bench PRIVATE kvlib)
+
+add_executable(test_crash src/test_crash.cpp)
+target_link_libraries(test_crash PRIVATE kvlib)
+
+enable_testing()
+add_test(NAME crash_recovery COMMAND test_crash)
