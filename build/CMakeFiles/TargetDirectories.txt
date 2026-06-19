@@ -1,0 +1,4 @@
+C:/Users/ky805/Downloads/key-val/build/CMakeFiles/kvlib.dir
+C:/Users/ky805/Downloads/key-val/build/CMakeFiles/kvstore.dir
+C:/Users/ky805/Downloads/key-val/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/ky805/Downloads/key-val/build/CMakeFiles/ZERO_CHECK.dir
