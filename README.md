@@ -181,3 +181,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for:
 - WAL segment lifecycle diagram
 - Compaction commit-point logic
 - Thread safety model
+
+  See [GUIDE.md](GUIDE.md) for:
+- How to start this project
+- How to perform operations in this Project.
