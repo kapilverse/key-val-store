@@ -1,4 +1,4 @@
-# key-val
+# KEY VALUE VAULT
 
 A from-scratch LSM-tree key-value store in C++17. Implements the core of engines like LevelDB/RocksDB: write-ahead log, sorted MemTable, immutable SSTables with Bloom filters, atomic MANIFEST, and crash-safe compaction.
 
